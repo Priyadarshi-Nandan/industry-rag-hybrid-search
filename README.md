@@ -2,6 +2,31 @@
 
 A local-first Retrieval-Augmented Generation (RAG) pipeline that ingests documents (TXT, PDF, DOCX), retrieves relevant evidence using hybrid search, and generates grounded, cited answers using a local LLM — no cloud APIs, no data leaving your machine.
 
+## Features
+
+- Multi-format ingestion: TXT, PDF, DOCX
+- Heading-aware chunking, every chunk carries its source file and section heading
+- Hybrid retrieval: vector search plus BM25 keyword search
+- Cross-encoder reranking of candidate chunks
+- Smart re-indexing: only new or changed files get embedded again
+- Multi-question chat loop in the terminal
+- Source citations with file and chapter, hidden when the model abstains
+- Token usage tracking per question and per session
+
+## Example session
+
+```
+Ask a question: tell me about the sun
+
+Answer: The Sun is the central star of the Solar System. It is a nearly perfect
+sphere of hot plasma, heated by nuclear fusion reactions in its core...
+
+Sources:
+  - solar_system.pdf → Chapter 2: The Sun
+
+[Tokens] prompt: 687 | answer: 225 | this question: 912 | session total: 912 | time: 4.1s
+```
+
 ## Architecture
 
 ```
@@ -19,7 +44,10 @@ Retrieval:
     -> keyword search (BM25)             -----+--> merged candidates
     -> reranked (cross-encoder, ms-marco-MiniLM-L-6-v2)
     -> top chunks -> prompt -> local LLM (qwen2.5:3b via Ollama)
-    -> grounded answer with source citation
+    -> grounded answer
+    -> sources (file + heading, only if the model actually answered)
+    -> token usage report
+    -> back to the next question
 ```
 
 ## Stack and links
@@ -70,16 +98,18 @@ If you want to run this on your own computer, follow these steps:
 ## Known limitations
 
 - Small local models occasionally abstain even when evidence is present (model inconsistency, not a retrieval failure — verified by rerunning identical queries).
+- Very short or vague questions (like a single word) can retrieve weak chunks and end in an abstention, even when the answer exists.
+- Every question is answered independently, there is no conversation memory yet.
 - Terminal-only interface, no web UI yet.
 - Not tested against very large document sets or non-text PDF content (scanned pages, charts).
 
 ## Future plans
 
+- Skip the LLM call when retrieval confidence is very low (saves tokens)
+- Split the code into separate ingestion and retrieval modules
+- Conversation memory
 - Query rewriting
 - Multi-hop retrieval
-- Conversation memory
-- Token usage tracking
-- Metadata-based source citations
 - Hosted frontend with document upload
 
 ---
@@ -116,6 +146,16 @@ Because splitting always starts at the heading level and only goes smaller when 
 
 Re-ran the same failing question afterward and got the correct answer, cited to the right chapter. Genuinely satisfying to catch and fix.
 
+### Getting the sources right (the other annoying one)
+
+After the chunking fix I added source citations, and they kept showing the wrong thing. Asking about the Sun listed "general content" instead of "Chapter 2: The Sun," even though the database clearly stored the right heading for every chunk. I confirmed that by querying ChromaDB directly, which ruled out the chunker and the database.
+
+The actual bug was in the hybrid search merge. The BM25 results were built with only the text and the source file, no heading, and when the same chunk came back from both searches, the BM25 version overwrote the vector version. So any chunk BM25 found silently lost its heading. One missing key in one dictionary. Adding the heading to the BM25 results fixed it, and the lesson was to check each stage separately before touching the code.
+
+### What the token counter showed
+
+I added a token counter to see where the cost goes. The prompt is usually 3 to 7 times bigger than the answer, because the retrieved chunks fill it. A question the model can't answer still spent about 590 tokens just to say "I don't have enough information." That gives me a clear first optimization target: skip the model call when the retrieved chunks are clearly not relevant.
+
 ### Where it's at now
 
-Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, and grounded generation. Next up is cleaning up the terminal output, adding source metadata to answers, and eventually building this into a proper hosted app.
+Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop, and token tracking. Next up is separating ingestion from retrieval, adding conversation memory, and eventually building this into a hosted app.
