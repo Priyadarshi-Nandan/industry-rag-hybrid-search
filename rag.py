@@ -47,7 +47,7 @@ def chunk_text(text, chunk_size=500):
             heading = heading_match.group(1).strip()
             content = section[heading_match.end():].strip()
         else:
-            heading = ""
+            heading = "Introduction / Untitled Section"
             content = section
 
         if len(section) <= chunk_size:
@@ -127,7 +127,7 @@ def index_documents():
             ids=[doc["id"]],
             embeddings=[embedding],
             documents=[doc["text"]],
-            metadatas=[{"source": doc["source"], "hash": file_hash}]
+            metadatas=[{"source": doc["source"], "hash": file_hash, "heading": doc.get("heading") or "Introduction / Untitled Section"}]
         )
     print("Indexed all new/changed chunks into ChromaDB")
 
@@ -139,6 +139,7 @@ def retrieve(question, top_k=4):
         matches.append({
             "text": results["documents"][0][i],
             "source": results["metadatas"][0][i]["source"],
+            "heading": results["metadatas"][0][i].get("heading", ""),
             "distance": results["distances"][0][i]
         })
     return matches
@@ -151,7 +152,7 @@ def hybrid_retrieve(question, docs, bm25, top_k=4):
     tokenized_query = question.lower().split()
     bm25_scores = bm25.get_scores(tokenized_query)
     top_bm25_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:top_k]
-    bm25_results = [{"text": docs[i]["text"], "source": docs[i]["source"]} for i in top_bm25_indices]
+    bm25_results = [{"text": docs[i]["text"], "source": docs[i]["source"], "heading": docs[i]["heading"]} for i in top_bm25_indices]
 
     # Combine, removing duplicates by text
     combined = {r["text"]: r for r in vector_results}
@@ -163,10 +164,10 @@ def hybrid_retrieve(question, docs, bm25, top_k=4):
 def rerank(question, matches):
     pairs = [[question, m["text"]] for m in matches]
     scores = reranker.predict(pairs)
-    print("Rerank scores:", scores)
-    scored = list(zip(scores, matches))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [m for score, m in scored]
+    for m, score in zip(matches, scores):
+        m["rerank_score"] = score
+    matches.sort(key=lambda m: m["rerank_score"], reverse=True)
+    return matches
 
 def build_prompt(question, matches):
     context = "\n\n".join([f"[{m['source']}]: {m['text']}" for m in matches])
@@ -181,26 +182,63 @@ def build_prompt(question, matches):
 if __name__ == "__main__":
     docs = load_documents()
     bm25 = build_bm25_index(docs)
-
     index_documents()
 
-    question = input("\nAsk a question: ")
-    matches = hybrid_retrieve(question, docs, bm25)
-    matches = rerank(question, matches)
+    print("\nRAG is ready. Type 'exit' to stop.")
 
-    print(f"\nQuestion: {question}\n")
-    for m in matches:
-        dist = m.get("distance", "N/A (BM25 match)")
-        print(f"Distance: {dist} | Source: {m['source']}")
-        print(m["text"])
-        print("---")
+    session_tokens = 0
 
-    prompt = build_prompt(question, matches)
-    # response = ollama.generate(model=GEN_MODEL, prompt=prompt)
-    response = ollama.generate(
-    model=GEN_MODEL,
-    prompt=prompt,
-    options={"temperature": 0, "num_predict": 300}
-)
-    print("\n=== ANSWER ===")
-    print(response["response"])
+    while True:
+        question = input("\nAsk a question: ")
+
+        if question.lower() == "exit":
+            break
+
+        matches = hybrid_retrieve(question, docs, bm25)
+        matches = rerank(question, matches)
+
+        prompt = build_prompt(question, matches)
+        response = ollama.generate(
+            model=GEN_MODEL,
+            prompt=prompt,
+            options={"temperature": 0, "num_predict": 300}
+        )
+
+        top_matches = [m for m in matches if m.get("rerank_score", 0) > 0]
+        if not top_matches:
+            top_matches = matches[:2]
+
+        source_map = {}
+        for m in top_matches:
+            file = m["source"]
+            heading = m.get("heading")
+            if heading == "Introduction / Untitled Section":
+                heading = None
+            source_map.setdefault(file, set())
+            if heading:
+                source_map[file].add(heading)
+
+        source_lines = []
+        for file, headings in sorted(source_map.items()):
+            if headings:
+                source_lines.append(f"{file} → {', '.join(sorted(headings))}")
+            else:
+                source_lines.append(file)
+
+        is_abstention = "i don't have enough information" in response["response"].lower()
+
+
+        print(f"\nAnswer: {response['response']}")
+
+        if not is_abstention:
+            print("\nSources:")
+            for line in source_lines:
+                print(f"  - {line}")
+
+
+        prompt_tokens = response.get("prompt_eval_count", 0)
+        output_tokens = response.get("eval_count", 0)
+        seconds = response.get("total_duration", 0) / 1e9
+        session_tokens += prompt_tokens + output_tokens
+
+        print(f"\n[Tokens] prompt: {prompt_tokens} | answer: {output_tokens} | this question: {prompt_tokens + output_tokens} | session total: {session_tokens} | time: {seconds:.1f}s")
