@@ -19,6 +19,7 @@ client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection(name="documents")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+
 def read_pdf(path):
     reader = PdfReader(path)
     text = ""
@@ -26,12 +27,12 @@ def read_pdf(path):
         text += page.extract_text() + "\n"
     return text
 
-from docx import Document
 
 def read_docx(path):
     doc = Document(path)
     text = "\n".join([para.text for para in doc.paragraphs])
     return text
+
 
 def chunk_text(text, chunk_size=500):
     sections = re.split(r'(?=^#{1,3}\s|^Chapter \d+:)', text, flags=re.MULTILINE)
@@ -82,9 +83,11 @@ def chunk_text(text, chunk_size=500):
 
     return chunks
 
+
 def get_file_hash(path):
     with open(path, "rb") as f:
         return hashlib.md5(f.read()).hexdigest()
+
 
 def load_documents():
     docs = []
@@ -104,14 +107,17 @@ def load_documents():
             docs.append({"id": f"{filename}#chunk{i}", "source": filename, "text": piece["text"], "heading": piece["heading"]})
     return docs
 
+
 def build_bm25_index(docs):
     tokenized = [doc["text"].lower().split() for doc in docs]
     bm25 = BM25Okapi(tokenized)
     return bm25
 
+
 def embed_text(text):
     response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
     return response["embedding"]
+
 
 def index_documents():
     docs = load_documents()
@@ -131,6 +137,7 @@ def index_documents():
         )
     print("Indexed all new/changed chunks into ChromaDB")
 
+
 def retrieve(question, top_k=4):
     q_embedding = embed_text(question)
     results = collection.query(query_embeddings=[q_embedding], n_results=top_k)
@@ -143,6 +150,7 @@ def retrieve(question, top_k=4):
             "distance": results["distances"][0][i]
         })
     return matches
+
 
 def hybrid_retrieve(question, docs, bm25, top_k=4):
     # Vector search
@@ -161,6 +169,7 @@ def hybrid_retrieve(question, docs, bm25, top_k=4):
 
     return list(combined.values())
 
+
 def rerank(question, matches):
     pairs = [[question, m["text"]] for m in matches]
     scores = reranker.predict(pairs)
@@ -169,15 +178,71 @@ def rerank(question, matches):
     matches.sort(key=lambda m: m["rerank_score"], reverse=True)
     return matches
 
-def build_prompt(question, matches):
+
+def build_prompt(question, matches, history=None):
     context = "\n\n".join([f"[{m['source']}]: {m['text']}" for m in matches])
-    prompt = "Answer the question using ONLY the context below.\n"
-    prompt += "If the context doesn't contain the answer, say \"I don't have enough information.\"\n"
+    prompt = "Answer the question using the context below as your only evidence.\n"
+    prompt += "Say \"I don't have enough information.\" only if the context contains nothing related to the question.\n"
+    prompt += "If the context is related but incomplete, answer with what it does say.\n"
+    prompt += "Never do both: either answer from the context, or reply with only: I don't have enough information.\n"
     prompt += "Cite the source filename in your answer.\n\n"
+    if history:
+        prompt += "Earlier conversation (use it only to understand what the question refers to, not as evidence):\n"
+        for past_question, past_answer in history[-3:]:
+            prompt += f"User: {past_question}\nAssistant: {past_answer}\n"
+        prompt += "\n"
     prompt += f"Context:\n{context}\n\n"
     prompt += f"Question: {question}\n\n"
     prompt += "Answer:"
     return prompt
+
+PRONOUNS = {"it", "its", "it's", "this", "that", "these", "those", "they", "them", "their", "he", "she", "his", "her"}
+
+
+def needs_rewrite(question):
+    cleaned = question.lower().replace("?", "").replace(",", "")
+    for word in cleaned.split():
+        if word in PRONOUNS:
+            return True
+    return False
+
+def rewrite_question(question, history):
+    if not history or not needs_rewrite(question):
+        return question
+
+    recent = ""
+    for past_question, past_answer in history[-2:]:
+        recent += f"User: {past_question}\nAssistant: {past_answer[:200]}\n"
+
+    prompt = (
+        "Rewrite the last question so it can be understood without the conversation. "
+        "Replace pronouns like it, its, this, that, they with the specific thing they refer to. "
+        "Never use 'this' or 'that' in the rewritten question, name the thing explicitly. "
+        "Reply with ONLY the rewritten question.\n\n"
+        "Example 1\n"
+        "User: tell me about the Eiffel Tower\n"
+        "Assistant: The Eiffel Tower is located in Paris, France.\n"
+        "Last question: how tall is it?\n"
+        "Rewritten question: How tall is the Eiffel Tower?\n\n"
+        "Example 2\n"
+        "User: what is Mount Fuji\n"
+        "Assistant: Mount Fuji is the highest mountain in Japan.\n"
+        "Last question: where is that located?\n"
+        "Rewritten question: Where is Mount Fuji located?\n\n"
+        "Now your turn\n"
+        f"{recent}"
+        f"Last question: {question}\n"
+        "Rewritten question:"
+    )
+    response = ollama.generate(
+        model=GEN_MODEL,
+        prompt=prompt,
+        options={"temperature": 0, "num_predict": 60}
+    )
+    rewritten = response["response"].strip()
+    if not rewritten:
+        return question
+    return rewritten
 
 if __name__ == "__main__":
     docs = load_documents()
@@ -185,8 +250,8 @@ if __name__ == "__main__":
     index_documents()
 
     print("\nRAG is ready. Type 'exit' to stop.")
-
     session_tokens = 0
+    history = []
 
     while True:
         question = input("\nAsk a question: ")
@@ -194,10 +259,13 @@ if __name__ == "__main__":
         if question.lower() == "exit":
             break
 
-        matches = hybrid_retrieve(question, docs, bm25)
-        matches = rerank(question, matches)
+        search_question = rewrite_question(question, history)
+        print(f"[Searching for: {search_question}]")
 
-        prompt = build_prompt(question, matches)
+        matches = hybrid_retrieve(search_question, docs, bm25)
+        matches = rerank(search_question, matches)
+
+        prompt = build_prompt(search_question, matches, history)
         response = ollama.generate(
             model=GEN_MODEL,
             prompt=prompt,
@@ -205,8 +273,10 @@ if __name__ == "__main__":
         )
 
         top_matches = [m for m in matches if m.get("rerank_score", 0) > 0]
+        low_confidence = False
         if not top_matches:
             top_matches = matches[:2]
+            low_confidence = True
 
         source_map = {}
         for m in top_matches:
@@ -225,16 +295,20 @@ if __name__ == "__main__":
             else:
                 source_lines.append(file)
 
-        is_abstention = "i don't have enough information" in response["response"].lower()
-
+        is_abstention = response["response"].strip().lower().startswith("i don't have enough information")
 
         print(f"\nAnswer: {response['response']}")
 
         if not is_abstention:
-            print("\nSources:")
+            if low_confidence:
+                print("\nSources (low confidence, the answer may come from earlier conversation):")
+            else:
+                print("\nSources:")
             for line in source_lines:
                 print(f"  - {line}")
 
+        if not is_abstention:
+            history.append((question, response["response"]))
 
         prompt_tokens = response.get("prompt_eval_count", 0)
         output_tokens = response.get("eval_count", 0)
