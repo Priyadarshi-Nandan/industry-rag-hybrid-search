@@ -10,22 +10,40 @@ A local-first Retrieval-Augmented Generation (RAG) pipeline that ingests documen
 - Cross-encoder reranking of candidate chunks
 - Smart re-indexing: only new or changed files get embedded again
 - Multi-question chat loop in the terminal
+- Conversation memory: follow-up questions like "how big is it?" work
+- Query rewriting: follow-ups are turned into standalone questions before searching
 - Source citations with file and chapter, hidden when the model abstains
+- Low-confidence sources are labeled instead of pretending to be solid evidence
 - Token usage tracking per question and per session
 
 ## Example session
 
 ```
-Ask a question: tell me about the sun
+Ask a question: tell me about jupiter
+[Searching for: tell me about jupiter]
 
-Answer: The Sun is the central star of the Solar System. It is a nearly perfect
-sphere of hot plasma, heated by nuclear fusion reactions in its core...
+Answer: Jupiter is the fifth planet from the Sun and the largest in the Solar System.
+It is a gas giant with a mass more than two and a half times that of all the other
+planets in the Solar System combined...
 
 Sources:
-  - solar_system.pdf → Chapter 2: The Sun
+  - solar_system.pdf → Chapter 7: Jupiter
 
-[Tokens] prompt: 687 | answer: 225 | this question: 912 | session total: 912 | time: 4.1s
+[Tokens] prompt: 798 | answer: 159 | this question: 957 | session total: 957 | time: 4.3s
+
+Ask a question: how many moons does it have
+[Searching for: How many moons does Jupiter have?]
+
+Answer: Jupiter has 95 known moons, according to the information provided in
+solar_system.pdf under Chapter 15: Moons of the Solar System.
+
+Sources:
+  - solar_system.pdf → Chapter 15: Moons of the Solar System, Chapter 7: Jupiter
+
+[Tokens] prompt: 868 | answer: 40 | this question: 908 | session total: 1865 | time: 0.9s
 ```
+
+The `[Searching for: ...]` line shows what the follow-up question was rewritten into before the search ran.
 
 ## Architecture
 
@@ -38,14 +56,16 @@ Ingestion:
     -> stored in ChromaDB (persistent vector store)
 
 Retrieval:
-  question
+  question + recent conversation history
+    -> query rewriting (local LLM turns "how big is it?" into "How big is Jupiter?")
     -> embedded (nomic-embed-text)
     -> vector search (ChromaDB)          -----+
     -> keyword search (BM25)             -----+--> merged candidates
     -> reranked (cross-encoder, ms-marco-MiniLM-L-6-v2)
-    -> top chunks -> prompt -> local LLM (qwen2.5:3b via Ollama)
+    -> top chunks + last 3 exchanges -> prompt -> local LLM (qwen2.5:3b via Ollama)
     -> grounded answer
     -> sources (file + heading, only if the model actually answered)
+    -> answer saved to conversation history
     -> token usage report
     -> back to the next question
 ```
@@ -99,7 +119,9 @@ If you want to run this on your own computer, follow these steps:
 
 - Small local models occasionally abstain even when evidence is present (model inconsistency, not a retrieval failure — verified by rerunning identical queries).
 - Very short or vague questions (like a single word) can retrieve weak chunks and end in an abstention, even when the answer exists.
-- Every question is answered independently, there is no conversation memory yet.
+- Query rewriting works well on clean follow-ups, but the 3B model can miss on garbled sentences or heavy typos (for example, leaving "this planet" unresolved). A larger model should help.
+- Questions that need counting or combining facts across chapters (like "how many gas giants are there?") often end in an abstention, since no single chunk states the answer.
+- Memory keeps only the last 3 exchanges, to keep the prompt size under control.
 - Terminal-only interface, no web UI yet.
 - Not tested against very large document sets or non-text PDF content (scanned pages, charts).
 
@@ -107,10 +129,10 @@ If you want to run this on your own computer, follow these steps:
 
 - Skip the LLM call when retrieval confidence is very low (saves tokens)
 - Split the code into separate ingestion and retrieval modules
-- Conversation memory
-- Query rewriting
 - Multi-hop retrieval
+- Try a larger local model (6-8B) and compare answer quality
 - Hosted frontend with document upload
+- Rebuild a smaller version with LangChain and LangGraph, to compare against the from-scratch version
 
 ---
 
@@ -156,6 +178,24 @@ The actual bug was in the hybrid search merge. The BM25 results were built with 
 
 I added a token counter to see where the cost goes. The prompt is usually 3 to 7 times bigger than the answer, because the retrieved chunks fill it. A question the model can't answer still spent about 590 tokens just to say "I don't have enough information." That gives me a clear first optimization target: skip the model call when the retrieved chunks are clearly not relevant.
 
+### Adding memory, and finding out it wasn't enough
+
+Once the loop worked, I wanted follow-up questions to work, like asking about Jupiter and then "what is its size?". The first step was easy: keep the last few question and answer pairs and put them in the prompt. That helped the model understand what "it" meant, but follow-ups still failed. The reason is that the search never sees the conversation. It looked up "size of this planet" with no mention of Jupiter, so the right chunk never reached the model, and the model correctly said it didn't have enough information.
+
+So memory has two halves: the model needs to understand the follow-up, and the search needs to understand it too.
+
+### Query rewriting
+
+The fix was to rewrite the follow-up into a standalone question before searching, using the local model itself: "what is its size" becomes "What is the size of Jupiter?". The first version rewrote inconsistently. The 3B model would sometimes leave "it" in place, or turn "this planet" into "this planet" again. Adding worked examples to the rewrite prompt fixed most of it, since small models follow examples much better than rules. One example is a question that should come back unchanged, because without it a standalone question about Mount Everest got rewritten to borrow words from the previous topic.
+
+I also tried gating the rewrite on a list of pronouns to save model calls, and dropped it. My own typing has plenty of typos ("thsi planet"), and a typo slipped straight past the pronoun list. The rewriter turned out to be good at fixing typos, so letting it run on every follow-up worked better than trying to be clever.
+
+### The model that was too cautious, then too chatty
+
+Tuning the prompt was a balancing act. With strict wording, the model said "I don't have enough information" even when the answer was right there, because the document says "diameter" and I asked about "size". Loosening the instruction fixed that, but then it started saying "I don't have enough information" followed by the answer anyway. The last change was to tell it to either answer or abstain, never both, and to only count an answer as an abstention if it starts with that phrase.
+
+One more thing I changed along the way: when nothing scores well, the system used to list the top two chunks as sources anyway. Those looked like real evidence even when the answer came from the earlier conversation. Now those are labeled low confidence instead.
+
 ### Where it's at now
 
-Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop, and token tracking. Next up is separating ingestion from retrieval, adding conversation memory, and eventually building this into a hosted app.
+Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop with conversation memory, query rewriting, and token tracking. On clean follow-ups it works reliably. On messy ones, the 3B model is the limit, and trying a larger model is on the list. Next up is separating ingestion from retrieval and eventually building this into a hosted app.
