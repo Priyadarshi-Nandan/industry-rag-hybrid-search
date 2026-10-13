@@ -14,7 +14,7 @@ load_dotenv()
 DOCS_FOLDER = os.getenv("DOCS_FOLDER")
 EMBED_MODEL = os.getenv("EMBED_MODEL")
 GEN_MODEL = os.getenv("GEN_MODEL")
-
+MAX_CHUNKS_TO_MODEL = 3
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection(name="documents")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
@@ -207,7 +207,7 @@ def needs_rewrite(question):
     return False
 
 def rewrite_question(question, history):
-    if not history or not needs_rewrite(question):
+    if not history:
         return question
 
     recent = ""
@@ -216,8 +216,10 @@ def rewrite_question(question, history):
 
     prompt = (
         "Rewrite the last question so it can be understood without the conversation. "
-        "Replace pronouns like it, its, this, that, they with the specific thing they refer to. "
+        "Replace words like it, its, this, that, they, there with the specific thing they refer to. "
         "Never use 'this' or 'that' in the rewritten question, name the thing explicitly. "
+        "Fix obvious spelling mistakes. "
+        "If the last question already names its subject, return it unchanged. "
         "Reply with ONLY the rewritten question.\n\n"
         "Example 1\n"
         "User: tell me about the Eiffel Tower\n"
@@ -229,6 +231,16 @@ def rewrite_question(question, history):
         "Assistant: Mount Fuji is the highest mountain in Japan.\n"
         "Last question: where is that located?\n"
         "Rewritten question: Where is Mount Fuji located?\n\n"
+        "Example 3\n"
+        "User: tell me about Iceland\n"
+        "Assistant: Iceland is an island nation in the North Atlantic.\n"
+        "Last question: which animals live there?\n"
+        "Rewritten question: Which animals live in Iceland?\n\n"
+        "Example 4\n"
+        "User: tell me about the Eiffel Tower\n"
+        "Assistant: The Eiffel Tower is located in Paris, France.\n"
+        "Last question: tell me about mount everest\n"
+        "Rewritten question: tell me about mount everest\n\n"
         "Now your turn\n"
         f"{recent}"
         f"Last question: {question}\n"
@@ -243,6 +255,24 @@ def rewrite_question(question, history):
     if not rewritten:
         return question
     return rewritten
+
+REFUSAL_PHRASES = [
+    "i don't have enough information",
+    "does not contain",
+    "do not contain",
+    "doesn't contain",
+    "no information about",
+]
+
+
+def looks_like_refusal(answer):
+    # Only the start of the answer is checked, so a normal answer that
+    # mentions one of these phrases later on isn't treated as a refusal.
+    start = answer.strip().lower()[:120]
+    for phrase in REFUSAL_PHRASES:
+        if phrase in start:
+            return True
+    return False
 
 if __name__ == "__main__":
     docs = load_documents()
@@ -265,17 +295,18 @@ if __name__ == "__main__":
         matches = hybrid_retrieve(search_question, docs, bm25)
         matches = rerank(search_question, matches)
 
-        prompt = build_prompt(search_question, matches, history)
+        prompt_matches = matches[:MAX_CHUNKS_TO_MODEL]
+        prompt = build_prompt(search_question, prompt_matches, history)
         response = ollama.generate(
             model=GEN_MODEL,
             prompt=prompt,
             options={"temperature": 0, "num_predict": 300}
         )
 
-        top_matches = [m for m in matches if m.get("rerank_score", 0) > 0]
+        top_matches = [m for m in prompt_matches if m.get("rerank_score", 0) > 0]
         low_confidence = False
         if not top_matches:
-            top_matches = matches[:2]
+            top_matches = prompt_matches[:2]
             low_confidence = True
 
         source_map = {}
@@ -295,7 +326,7 @@ if __name__ == "__main__":
             else:
                 source_lines.append(file)
 
-        is_abstention = response["response"].strip().lower().startswith("i don't have enough information")
+        is_abstention = looks_like_refusal(response["response"])
 
         print(f"\nAnswer: {response['response']}")
 
