@@ -15,6 +15,7 @@ A local-first Retrieval-Augmented Generation (RAG) pipeline that ingests documen
 - Source citations with file and chapter, hidden when the model abstains
 - Low-confidence sources are labeled instead of pretending to be solid evidence
 - Token usage tracking per question and per session
+- A fixed 15-question test set that scores the whole pipeline and saves a report with timing and token counts
 
 ## Example session
 
@@ -115,6 +116,24 @@ If you want to run this on your own computer, follow these steps:
    python rag.py
    ```
 
+## Testing
+
+`test_set.py` runs 15 fixed questions through the same pipeline as the chat loop and saves a report file with timing, token counts, and full details for any question that fails. The questions are 9 normal ones across the documents, 2 that the documents can't answer (the system should refuse), and 2 short follow-up conversations (4 questions) to test memory and query rewriting.
+
+Latest run (qwen2.5:3b, 3 chunks sent to the model per question):
+
+| Measure | Result |
+|---|---|
+| Score | 14 / 15 |
+| Right chunk reached the model | 13 / 13 |
+| Correct refusals | 2 / 2 |
+| Average time per question | 1.2 s |
+| Average tokens per question | 447 |
+
+The one failure (the length of the Great Wall) had the right chunk ranked first by a wide margin, and the 3B model still said it didn't have enough information. So that miss is on the model side, not the search side.
+
+Sending only the top 3 chunks to the model, instead of every candidate, cut tokens per question from about 809 to 447. The score stayed at 14 / 15, though one question started passing and another stopped. I wrote the questions myself for these documents, so this is a regression check for my own changes, not a general accuracy number.
+
 ## Known limitations
 
 - Small local models occasionally abstain even when evidence is present (model inconsistency, not a retrieval failure — verified by rerunning identical queries).
@@ -130,7 +149,7 @@ If you want to run this on your own computer, follow these steps:
 - Skip the LLM call when retrieval confidence is very low (saves tokens)
 - Split the code into separate ingestion and retrieval modules
 - Multi-hop retrieval
-- Try a larger local model (6-8B) and compare answer quality
+- Rerun the test set on a larger local model (6-8B) and compare against the numbers above
 - Hosted frontend with document upload
 - Rebuild a smaller version with LangChain and LangGraph, to compare against the from-scratch version
 
@@ -196,6 +215,12 @@ Tuning the prompt was a balancing act. With strict wording, the model said "I do
 
 One more thing I changed along the way: when nothing scores well, the system used to list the top two chunks as sources anyway. Those looked like real evidence even when the answer came from the earlier conversation. Now those are labeled low confidence instead.
 
+### Testing it properly
+
+Up to this point I'd been judging every change by typing a few questions and reading the answers, which doesn't tell you much. So I wrote a fixed set of 15 questions with an expected keyword for each, and a script that runs them and writes a report. It checks two things separately, whether the right chunk reached the model and whether the final answer was right, so a failure points at either the search or the model.
+
+It paid off straight away. A follow-up like "which animals live there?" wasn't being rewritten, and the test caught it. Sending fewer chunks to the model cut the prompt size by almost half, and the test showed the score held. It also showed that the one remaining failure is the model refusing with the right text in front of it, which is useful to know before spending time tuning search.
+
 ### Where it's at now
 
-Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop with conversation memory, query rewriting, and token tracking. On clean follow-ups it works reliably. On messy ones, the 3B model is the limit, and trying a larger model is on the list. Next up is separating ingestion from retrieval and eventually building this into a hosted app.
+Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop with conversation memory, query rewriting, and token tracking. On clean follow-ups it works reliably. On messy ones, the 3B model is the limit, and trying a larger model is on the list. Next up is testing a larger model against the same questions, and then a simple hosted version.
