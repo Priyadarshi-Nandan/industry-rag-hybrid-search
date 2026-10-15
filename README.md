@@ -120,19 +120,22 @@ If you want to run this on your own computer, follow these steps:
 
 `test_set.py` runs 15 fixed questions through the same pipeline as the chat loop and saves a report file with timing, token counts, and full details for any question that fails. The questions are 9 normal ones across the documents, 2 that the documents can't answer (the system should refuse), and 2 short follow-up conversations (4 questions) to test memory and query rewriting.
 
-Latest run (qwen2.5:3b, 3 chunks sent to the model per question):
+Two runs on the same 15 questions, with 3 chunks sent to the model per question:
 
-| Measure | Result |
-|---|---|
-| Score | 14 / 15 |
-| Right chunk reached the model | 13 / 13 |
-| Correct refusals | 2 / 2 |
-| Average time per question | 1.2 s |
-| Average tokens per question | 447 |
+| Measure | qwen2.5:3b | qwen2.5:7b |
+|---|---|---|
+| Score | 14 / 15 | 15 / 15 |
+| Right chunk reached the model | 13 / 13 | 13 / 13 |
+| Correct refusals | 2 / 2 | 2 / 2 |
+| Average time per question | 1.2 s | 7.2 s |
+| Average time, first question excluded | 0.9 s | 2.1 s |
+| Average tokens per question | 447 | 451 |
 
-The one failure (the length of the Great Wall) had the right chunk ranked first by a wide margin, and the 3B model still said it didn't have enough information. So that miss is on the model side, not the search side.
+The first question includes loading the model into memory (about 6 s for the 3B, 79 s for the 7B), which inflates the plain averages, so the time without it is listed too.
 
-Sending only the top 3 chunks to the model, instead of every candidate, cut tokens per question from about 809 to 447. The score stayed at 14 / 15, though one question started passing and another stopped. I wrote the questions myself for these documents, so this is a regression check for my own changes, not a general accuracy number.
+The one question the 3B model failed (the length of the Great Wall) had the right chunk ranked first by a wide margin, and the 3B still said it didn't have enough information. The 7B passes it with exactly the same chunks, so that miss was the model, not the search. The better model isn't free, though: once loaded, it answers about 2.4 times slower.
+
+Sending only the top 3 chunks to the model, instead of every candidate, cut tokens per question from about 809 to 447. The score stayed at 14 / 15, though one question started passing and another stopped. I wrote the questions myself for these documents, so this is a regression check for my own changes, not a general accuracy number. With only 15 questions, one question is worth about 7 points, so a 14 versus 15 gap is a hint and not proof. The 7B now passes everything, which means this set is too easy to tell better models apart, and a harder set would be needed to compare further.
 
 ## Known limitations
 
@@ -149,7 +152,7 @@ Sending only the top 3 chunks to the model, instead of every candidate, cut toke
 - Skip the LLM call when retrieval confidence is very low (saves tokens)
 - Split the code into separate ingestion and retrieval modules
 - Multi-hop retrieval
-- Rerun the test set on a larger local model (6-8B) and compare against the numbers above
+- Write a harder test set (questions that need facts from several chapters) and compare other 7-8B models on it
 - Hosted frontend with document upload
 - Rebuild a smaller version with LangChain and LangGraph, to compare against the from-scratch version
 
@@ -219,8 +222,8 @@ One more thing I changed along the way: when nothing scores well, the system use
 
 Up to this point I'd been judging every change by typing a few questions and reading the answers, which doesn't tell you much. So I wrote a fixed set of 15 questions with an expected keyword for each, and a script that runs them and writes a report. It checks two things separately, whether the right chunk reached the model and whether the final answer was right, so a failure points at either the search or the model.
 
-It paid off straight away. A follow-up like "which animals live there?" wasn't being rewritten, and the test caught it. Sending fewer chunks to the model cut the prompt size by almost half, and the test showed the score held. It also showed that the one remaining failure is the model refusing with the right text in front of it, which is useful to know before spending time tuning search.
+It paid off straight away. A follow-up like "which animals live there?" wasn't being rewritten, and the test caught it. Sending fewer chunks to the model cut the prompt size by almost half, and the test showed the score held. It also showed that the one remaining failure is the model refusing with the right text in front of it, which is useful to know before spending time tuning search. Switching to a 7B model then fixed that failure with the same chunks, at the cost of answers coming back about 2.4 times slower once the model was loaded, so the better model isn't free.
 
 ### Where it's at now
 
-Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop with conversation memory, query rewriting, and token tracking. On clean follow-ups it works reliably. On messy ones, the 3B model is the limit, and trying a larger model is on the list. Next up is testing a larger model against the same questions, and then a simple hosted version.
+Current state is a working local pipeline covering ingestion, hybrid retrieval, reranking, grounded generation, source citations with headings, a multi-question loop with conversation memory, query rewriting, and token tracking. On clean follow-ups it works reliably. On messy ones, the 3B model is the limit, and trying a larger model is on the list. Next up is a simple hosted version.
